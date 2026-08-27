@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>Arabic Character Recognizer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.20.0/tf.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 640px;
+      margin: 30px auto;
+      text-align: center;
+      color: #222;
+    }
+    h1 { font-size: 22px; }
+    #video, #overlayCanvas {
+      width: 320px;
+      height: 240px;
+      border-radius: 8px;
+      background: #000;
+    }
+    #stage { position: relative; display: inline-block; }
+    #preview {
+      width: 128px;
+      height: 128px;
+      image-rendering: pixelated;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+    }
+    button {
+      padding: 10px 18px;
+      margin: 8px 5px;
+      font-size: 15px;
+      border: none;
+      border-radius: 6px;
+      background: #2563eb;
+      color: white;
+      cursor: pointer;
+    }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    #result {
+      font-size: 48px;
+      margin: 10px 0;
+      min-height: 60px;
+    }
+    #topk { font-size: 14px; color: #444; text-align: left; display: inline-block; }
+    #status { color: #666; font-size: 13px; margin-top: 6px; }
+    .row { display: flex; justify-content: center; align-items: center; gap: 10px; }
+  </style>
+</head>
+<body>
+  <h1>📷 Arabic Character Recognizer</h1>
+  <p id="status">Loading model…</p>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+  <canvas id="hiddenCanvas" width="64" height="64" style="display:none;"></canvas>
+
+  <div class="row">
+    <button id="startBtn">Start Camera</button>
+    <button id="captureBtn" disabled>Capture &amp; Predict</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="invertToggle"> Invert colors (try this if predictions look wrong)</label>
+  </div>
+
+  <div>
+    <canvas id="preview" width="64" height="64"></canvas>
+  </div>
+
+  <div id="result">—</div>
+  <div id="topk"></div>
+
+  <script>
+    // ------------------------------------------------------------------
+    // 1. CONFIG — edit these two things before deploying
+    // ------------------------------------------------------------------
+
+    // URL to the folder where you uploaded tfjs_model/ (model.json + .bin shard).
+    // Apps Script cannot host a 28MB binary file itself, so host this folder
+    // on GitHub Pages, Firebase Hosting, or Google Cloud Storage, and point
+    // this at the model.json URL. Example:
+    // 'https://yourusername.github.io/arabic-model/tfjs_model/model.json'
+    const MODEL_URL = 'https://ajtamimi.github.io/arabic-model1/tfjs_model/model.json';
+
+
+    // Class labels IN THE EXACT ORDER used when the model was trained.
+    // This model has 32 output classes. Replace this placeholder list with
+    // your real label order (check your training notebook / dataset folder
+    // names) — otherwise the predicted letters will be wrong even if the
+    // model itself is working correctly.
+    const LABELS = [
+      'Class 0','Class 1','Class 2','Class 3','Class 4','Class 5','Class 6','Class 7',
+      'Class 8','Class 9','Class 10','Class 11','Class 12','Class 13','Class 14','Class 15',
+      'Class 16','Class 17','Class 18','Class 19','Class 20','Class 21','Class 22','Class 23',
+      'Class 24','Class 25','Class 26','Class 27','Class 28','Class 29','Class 30','Class 31'
+    ];
+
+    // ------------------------------------------------------------------
+    // 2. App logic — shouldn't need to change this
+    // ------------------------------------------------------------------
+    let model, stream;
+    const video = document.getElementById('video');
+    const hiddenCanvas = document.getElementById('hiddenCanvas');
+    const preview = document.getElementById('preview');
+    const statusEl = document.getElementById('status');
+    const resultEl = document.getElementById('result');
+    const topkEl = document.getElementById('topk');
+    const startBtn = document.getElementById('startBtn');
+    const captureBtn = document.getElementById('captureBtn');
+    const invertToggle = document.getElementById('invertToggle');
+
+    async function loadModel() {
+      try {
+        model = await tf.loadLayersModel(MODEL_URL);
+        statusEl.textContent = 'Model loaded. Click "Start Camera".';
+      } catch (e) {
+        statusEl.textContent = 'Could not load model — check MODEL_URL. (' + e.message + ')';
+        console.error(e);
+      }
+    }
+
+    startBtn.addEventListener('click', async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 }, audio: false });
+        video.srcObject = stream;
+        captureBtn.disabled = false;
+        statusEl.textContent = 'Camera ready. Center the character and click Capture.';
+      } catch (e) {
+        statusEl.textContent = 'Camera access failed: ' + e.message;
+      }
+    });
+
+    captureBtn.addEventListener('click', () => {
+      if (!model) { statusEl.textContent = 'Model is not loaded yet.'; return; }
+      predict();
+    });
+
+    function predict() {
+      const ctx = hiddenCanvas.getContext('2d');
+      // Draw the current video frame, downscaled straight to 64x64
+      // (matches the model's expected input size).
+      ctx.drawImage(video, 0, 0, 64, 64);
+      const imageData = ctx.getImageData(0, 0, 64, 64);
+
+      // Convert to grayscale + normalize to [0,1]
+      const data = imageData.data;
+      const gray = new Float32Array(64 * 64);
+      for (let i = 0; i < 64 * 64; i++) {
+        const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+        let v = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        if (invertToggle.checked) v = 1 - v;
+        gray[i] = v;
+      }
+
+      // Show what the model actually "sees"
+      const pctx = preview.getContext('2d');
+      const previewData = pctx.createImageData(64, 64);
+      for (let i = 0; i < 64 * 64; i++) {
+        const v = Math.round(gray[i] * 255);
+        previewData.data[i * 4] = v;
+        previewData.data[i * 4 + 1] = v;
+        previewData.data[i * 4 + 2] = v;
+        previewData.data[i * 4 + 3] = 255;
+      }
+      pctx.putImageData(previewData, 0, 0);
+
+      tf.tidy(() => {
+        const input = tf.tensor(gray, [1, 64, 64, 1]);
+        const output = model.predict(input);
+        const probs = output.dataSync();
+
+        // Top prediction
+        let best = 0;
+        for (let i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
+        resultEl.textContent = LABELS[best] + '  (' + (probs[best] * 100).toFixed(1) + '%)';
+
+        // Top-3
+        const idx = Array.from(probs.keys()).sort((a, b) => probs[b] - probs[a]).slice(0, 3);
+        topkEl.innerHTML = idx.map(i =>
+          (LABELS[i] || ('#' + i)) + ': ' + (probs[i] * 100).toFixed(1) + '%'
+        ).join('<br>');
+      });
+    }
+
+    loadModel();
+  </script>
+</body>
+</html>
